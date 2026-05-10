@@ -16,7 +16,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Extensions probed when resolving an alias target
-_PROBE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".vue"]
+_PROBE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".vue", ".mpx"]
 
 # Tsconfig filenames to look for when walking up the directory tree
 _TSCONFIG_NAMES = ["tsconfig.json", "tsconfig.app.json"]

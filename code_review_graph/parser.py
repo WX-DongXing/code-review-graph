@@ -104,6 +104,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".scala": "scala",
     ".sol": "solidity",
     ".vue": "vue",
+    ".mpx": "mpx",
     ".dart": "dart",
     ".r": "r",  # .lower() in detect_language handles .R → .r
     ".mjs": "javascript",
@@ -907,6 +908,10 @@ class CodeParser:
         if language == "svelte":
             return self._parse_svelte(path, source)
 
+        # Mpx SFCs: independently scan Mpx blocks, then parse JS/TS scripts.
+        if language == "mpx":
+            return self._parse_mpx(path, source)
+
         # Jupyter notebooks: extract code cells and parse as Python
         if language == "notebook":
             return self._parse_notebook(path, source)
@@ -1100,6 +1105,350 @@ class CodeParser:
                     ))
 
         return all_nodes, all_edges
+
+    def _parse_mpx(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse an Mpx SFC using an independent block scanner."""
+        file_path_str = str(path)
+        test_file = _is_test_file(file_path_str)
+
+        all_nodes: list[NodeInfo] = [NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="mpx",
+            is_test=test_file,
+        )]
+        all_edges: list[EdgeInfo] = []
+        using_components: dict[str, str] = {}
+
+        for script_source, script_lang, script_type, line_offset in (
+            self._iter_mpx_script_blocks(source)
+        ):
+            if script_type in ("application/json", "mpx-json-js"):
+                if script_type == "application/json":
+                    try:
+                        config = json.loads(
+                            script_source.decode("utf-8", errors="replace"),
+                        )
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(config, dict):
+                        continue
+                    config_components = config.get("usingComponents")
+                    if not isinstance(config_components, dict):
+                        continue
+                    component_entries = {
+                        name: path
+                        for name, path in config_components.items()
+                        if isinstance(name, str) and isinstance(path, str)
+                    }
+                else:
+                    component_entries = (
+                        self._extract_mpx_using_components_from_js_config(
+                            script_source,
+                        )
+                    )
+
+                for component_name, component_path in component_entries.items():
+                    using_components[component_name] = component_path
+                    all_edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path_str,
+                        target=component_path,
+                        file_path=file_path_str,
+                        line=line_offset + 1,
+                        extra={
+                            "component": component_name,
+                        },
+                    ))
+                continue
+
+            script_parser = self._get_parser(script_lang)
+            if not script_parser:
+                continue
+
+            script_tree = script_parser.parse(script_source)
+            import_map, defined_names = self._collect_file_scope(
+                script_tree.root_node, script_lang, script_source,
+            )
+
+            nodes: list[NodeInfo] = []
+            edges: list[EdgeInfo] = []
+            self._extract_from_tree(
+                script_tree.root_node, script_source,
+                script_lang, file_path_str, nodes, edges,
+                import_map=import_map,
+                defined_names=defined_names,
+            )
+
+            for node in nodes:
+                node.line_start += line_offset
+                node.line_end += line_offset
+                node.language = "mpx"
+            for edge in edges:
+                edge.line += line_offset
+
+            all_nodes.extend(nodes)
+            all_edges.extend(edges)
+
+        script_symbols = {
+            node.name: self._qualify(node.name, node.file_path, node.parent_name)
+            for node in all_nodes
+            if node.kind in ("Class", "Function", "Test", "Type")
+        }
+        for template_source, line_offset in self._iter_mpx_template_blocks(source):
+            all_edges.extend(self._extract_mpx_template_references(
+                template_source,
+                line_offset,
+                file_path_str,
+                using_components,
+                script_symbols,
+            ))
+
+        if test_file:
+            test_qnames = set()
+            for n in all_nodes:
+                if n.is_test:
+                    qn = self._qualify(n.name, n.file_path, n.parent_name)
+                    test_qnames.add(qn)
+            for edge in list(all_edges):
+                if edge.kind == "CALLS" and edge.source in test_qnames:
+                    all_edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
+
+        return all_nodes, all_edges
+
+    def _iter_mpx_script_blocks(
+        self, source: bytes,
+    ) -> list[tuple[bytes, str, Optional[str], int]]:
+        """Return Mpx script blocks without asking tree-sitter for an Mpx grammar."""
+        script_block_re = re.compile(
+            rb"<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script\s*>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        attr_re = re.compile(
+            rb"([^\s=/>]+)(?:\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+)))?",
+        )
+
+        blocks: list[tuple[bytes, str, Optional[str], int]] = []
+        for match in script_block_re.finditer(source):
+            script_lang = "javascript"
+            script_type = None
+
+            for attr_match in attr_re.finditer(match.group("attrs")):
+                attr_name = attr_match.group(1).decode(
+                    "utf-8", errors="replace",
+                ).lower()
+                raw_value = next(
+                    (group for group in attr_match.groups()[1:] if group is not None),
+                    None,
+                )
+                if raw_value is None:
+                    continue
+                attr_value = raw_value.decode("utf-8", errors="replace")
+                if attr_name == "lang" and attr_value in ("ts", "typescript"):
+                    script_lang = "typescript"
+                elif attr_name == "type":
+                    script_type = attr_value.lower()
+                elif attr_name == "name" and attr_value.lower() == "json":
+                    script_type = "mpx-json-js"
+
+            line_offset = source.count(b"\n", 0, match.start("body"))
+            blocks.append((match.group("body"), script_lang, script_type, line_offset))
+        return blocks
+
+    def _extract_mpx_using_components_from_js_config(
+        self, source: bytes,
+    ) -> dict[str, str]:
+        """Extract usingComponents from an Mpx ``<script name="json">`` block."""
+        text = source.decode("utf-8", errors="replace")
+        key_re = re.compile(
+            r"(?:^|[,{]\s*)(?:usingComponents|['\"]usingComponents['\"])\s*:",
+        )
+        match = key_re.search(text)
+        if not match:
+            return {}
+
+        brace_start = text.find("{", match.end())
+        if brace_start == -1:
+            return {}
+        brace_end = self._find_matching_js_brace(text, brace_start)
+        if brace_end is None:
+            return {}
+
+        body = text[brace_start + 1:brace_end]
+        pair_re = re.compile(
+            r"(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_$][\w$-]*))"
+            r"\s*:\s*(?:'([^']*)'|\"([^\"]*)\")",
+        )
+        components: dict[str, str] = {}
+        for pair in pair_re.finditer(body):
+            name = pair.group(1) or pair.group(2) or pair.group(3)
+            path = pair.group(4) or pair.group(5)
+            if name and path:
+                components[name] = path
+        return components
+
+    @staticmethod
+    def _find_matching_js_brace(text: str, brace_start: int) -> Optional[int]:
+        """Find a matching ``}``, ignoring braces inside JS strings/comments."""
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        in_line_comment = False
+        in_block_comment = False
+
+        i = brace_start
+        while i < len(text):
+            char = text[i]
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+
+            if in_line_comment:
+                if char == "\n":
+                    in_line_comment = False
+                i += 1
+                continue
+            if in_block_comment:
+                if char == "*" and nxt == "/":
+                    in_block_comment = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                i += 1
+                continue
+
+            if char == "/" and nxt == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if char == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+                continue
+            if char in ("'", '"', "`"):
+                quote = char
+                i += 1
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    def _iter_mpx_template_blocks(self, source: bytes) -> list[tuple[bytes, int]]:
+        """Return Mpx template blocks and their line offsets."""
+        template_block_re = re.compile(
+            rb"<template\b[^>]*>(?P<body>.*?)</template\s*>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        blocks: list[tuple[bytes, int]] = []
+        for match in template_block_re.finditer(source):
+            line_offset = source.count(b"\n", 0, match.start("body"))
+            blocks.append((match.group("body"), line_offset))
+        return blocks
+
+    def _extract_mpx_template_references(
+        self,
+        template_source: bytes,
+        line_offset: int,
+        file_path: str,
+        using_components: dict[str, str],
+        script_symbols: dict[str, str],
+    ) -> list[EdgeInfo]:
+        """Extract conservative references from an Mpx template block."""
+        tag_re = re.compile(
+            rb"<\s*(?P<tag>[A-Za-z][\w.-]*)(?P<attrs>[^<>]*)/?>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        event_attr_re = re.compile(
+            rb"\b(?P<attr>(?:capture-)?(?:bind|catch)[\w:-]*)"
+            rb"\s*=\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s\"'=<>`]+))",
+            re.IGNORECASE,
+        )
+        handler_re = re.compile(r"^\s*([A-Za-z_$][\w$]*)\s*(?:\(|$)")
+
+        refs: list[EdgeInfo] = []
+        seen: set[tuple[str, str, int, str]] = set()
+        for match in tag_re.finditer(template_source):
+            tag = match.group("tag").decode("utf-8", errors="replace")
+            line = line_offset + template_source.count(b"\n", 0, match.start()) + 1
+
+            component_target = using_components.get(tag)
+            if component_target:
+                key = ("component", tag, line, component_target)
+                if key not in seen:
+                    seen.add(key)
+                    refs.append(EdgeInfo(
+                        kind="REFERENCES",
+                        source=file_path,
+                        target=component_target,
+                        file_path=file_path,
+                        line=line,
+                        extra={
+                            "component": tag,
+                        },
+                    ))
+
+            attrs = match.group("attrs")
+            for attr_match in event_attr_re.finditer(attrs):
+                raw_value = next(
+                    (
+                        group for group in (
+                            attr_match.group("dq"),
+                            attr_match.group("sq"),
+                            attr_match.group("bare"),
+                        )
+                        if group is not None
+                    ),
+                    b"",
+                )
+                value = raw_value.decode("utf-8", errors="replace")
+                handler_match = handler_re.match(value)
+                if not handler_match:
+                    continue
+                handler = handler_match.group(1)
+                target = script_symbols.get(handler)
+                if not target:
+                    continue
+                attr_name = attr_match.group("attr").decode(
+                    "utf-8", errors="replace",
+                )
+                key = ("event", attr_name, line, target)
+                if key in seen:
+                    continue
+                seen.add(key)
+                refs.append(EdgeInfo(
+                    kind="REFERENCES",
+                    source=file_path,
+                    target=target,
+                    file_path=file_path,
+                    line=line,
+                    extra={
+                        "binding": attr_name,
+                        "handler": handler,
+                    },
+                ))
+        return refs
 
     def _parse_svelte(
         self, path: Path, source: bytes,
@@ -5397,6 +5746,26 @@ class CodeParser:
                 if resolved:
                     return resolved
 
+        elif language == "mpx":
+            if module.startswith("."):
+                base = caller_dir / module
+                extensions = [".ts", ".js", ".mpx"]
+                if base.is_file():
+                    return str(base.resolve())
+                for ext in extensions:
+                    target = base.with_suffix(ext)
+                    if target.is_file():
+                        return str(target.resolve())
+                if base.is_dir():
+                    for ext in extensions:
+                        target = base / f"index{ext}"
+                        if target.is_file():
+                            return str(target.resolve())
+            else:
+                resolved = self._tsconfig_resolver.resolve_alias(module, file_path)
+                if resolved:
+                    return resolved
+
         elif language == "dart":
             if module.startswith("."):
                 # Dart relative imports include the .dart extension
@@ -5549,12 +5918,32 @@ class CodeParser:
 
         path = Path(module_file)
         language = self.detect_language(path)
-        if language not in ("javascript", "typescript", "tsx", "vue"):
+        if language not in ("javascript", "typescript", "tsx", "vue", "mpx"):
             return None
 
         try:
             source = path.read_bytes()
         except (OSError, PermissionError):
+            return None
+
+        if language == "mpx":
+            for script_source, script_lang, script_type, _ in (
+                self._iter_mpx_script_blocks(source)
+            ):
+                if script_type == "application/json":
+                    continue
+                script_parser = self._get_parser(script_lang)
+                if not script_parser:
+                    continue
+                script_tree = script_parser.parse(script_source)
+                _, defined_names = self._collect_file_scope(
+                    script_tree.root_node, script_lang, script_source,
+                )
+                if symbol_name in defined_names:
+                    result = self._qualify(symbol_name, module_file, None)
+                    self._export_symbol_cache[cache_key] = result
+                    return result
+            self._export_symbol_cache[cache_key] = None
             return None
 
         parser = self._get_parser(language)

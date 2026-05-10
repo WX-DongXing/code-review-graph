@@ -473,6 +473,180 @@ class TestCodeParser:
         func_names = {f.name for f in funcs}
         assert "greet" in func_names
 
+    # --- Mpx SFC tests ---
+
+    def test_detect_language_mpx(self):
+        assert self.parser.detect_language(Path("App.mpx")) == "mpx"
+
+    def test_parse_mpx_file(self):
+        nodes, _ = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+
+        file_nodes = [n for n in nodes if n.kind == "File"]
+        assert len(file_nodes) == 1
+        assert file_nodes[0].language == "mpx"
+
+        funcs = [n for n in nodes if n.kind == "Function"]
+        func_names = {f.name for f in funcs}
+        assert "increment" in func_names
+
+    def test_parse_mpx_does_not_use_mpx_tree_sitter_parser(self):
+        original_get_parser = self.parser._get_parser
+
+        def reject_mpx_parser(language):
+            if language == "mpx":
+                raise AssertionError(
+                    "Mpx parsing must not use a tree-sitter Mpx parser"
+                )
+            return original_get_parser(language)
+
+        self.parser._get_parser = reject_mpx_parser
+
+        nodes, edges = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+        func_names = {n.name for n in nodes if n.kind == "Function"}
+        import_targets = {e.target for e in edges if e.kind == "IMPORTS_FROM"}
+        assert "increment" in func_names
+        assert "../components/hello" in import_targets
+
+    def test_resolve_mpx_export_does_not_use_mpx_parser(self):
+        original_get_parser = self.parser._get_parser
+
+        def reject_mpx_parser(language):
+            if language == "mpx":
+                raise AssertionError("Mpx export resolution must not use an Mpx parser")
+            return original_get_parser(language)
+
+        self.parser._get_parser = reject_mpx_parser
+
+        result = self.parser._resolve_exported_symbol(
+            str(FIXTURES / "sample_mpx.mpx"), "increment"
+        )
+        assert result == str(FIXTURES / "sample_mpx.mpx") + "::increment"
+
+    def test_parse_mpx_imports(self):
+        _, edges = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+        imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
+        import_targets = {e.target for e in imports}
+        assert "@mpxjs/core" in import_targets
+        assert "../components/hello" in import_targets
+        using_component_imports = [
+            e for e in imports
+            if e.extra.get("component") == "hello"
+        ]
+        assert len(using_component_imports) == 1
+        assert using_component_imports[0].source == str(FIXTURES / "sample_mpx.mpx")
+        assert using_component_imports[0].extra == {"component": "hello"}
+
+    def test_parse_mpx_script_setup_function(self):
+        nodes, _ = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+        funcs = [
+            n for n in nodes
+            if n.kind == "Function" and n.name == "increment"
+        ]
+        assert len(funcs) == 1
+        assert funcs[0].name == "increment"
+
+    def test_parse_mpx_line_numbers_offset(self):
+        nodes, _ = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+        funcs = [n for n in nodes if n.kind == "Function" and n.name == "increment"]
+        assert len(funcs) == 1
+        assert funcs[0].line_start > 8
+
+    def test_parse_mpx_nodes_have_mpx_language(self):
+        nodes, _ = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+        for node in nodes:
+            assert node.language == "mpx"
+
+    def test_parse_mpx_empty_script(self):
+        source = b"<template><hello /></template>\n"
+        path = Path("empty_script.mpx")
+        nodes, _ = self.parser.parse_bytes(path, source)
+        assert len(nodes) == 1
+        assert nodes[0].kind == "File"
+
+    def test_parse_mpx_using_components_json_only(self):
+        source = (
+            b"<template><hello /></template>\n"
+            b"<script type=\"application/json\">\n"
+            b"{\"usingComponents\":{\"hello\":\"../components/hello\"}}\n"
+            b"</script>\n"
+        )
+        path = Path("json_only.mpx")
+        nodes, edges = self.parser.parse_bytes(path, source)
+        imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
+        assert [e.target for e in imports] == ["../components/hello"]
+        assert all(n.kind != "Function" for n in nodes)
+
+    def test_parse_mpx_using_components_name_json_script(self):
+        source = (
+            b"<template><mpx-icon /></template>\n"
+            b"<script name=\"json\">\n"
+            b"module.exports = {\n"
+            b"  component: true,\n"
+            b"  usingComponents: {\n"
+            b"    'mpx-icon': '@didi/mpx-ui/src/components/icon/icon'\n"
+            b"  }\n"
+            b"}\n"
+            b"</script>\n"
+        )
+        path = Path("name_json.mpx")
+        nodes, edges = self.parser.parse_bytes(path, source)
+        imports = [e for e in edges if e.kind == "IMPORTS_FROM"]
+        refs = [e for e in edges if e.kind == "REFERENCES"]
+
+        assert [e.target for e in imports] == [
+            "@didi/mpx-ui/src/components/icon/icon"
+        ]
+        assert imports[0].source == "name_json.mpx"
+        assert imports[0].extra == {"component": "mpx-icon"}
+        assert any(e.target == "@didi/mpx-ui/src/components/icon/icon" for e in refs)
+        assert all(n.kind != "Function" for n in nodes)
+
+    def test_parse_mpx_template_references_using_components(self):
+        _, edges = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+        refs = [
+            e for e in edges
+            if e.kind == "REFERENCES" and e.extra.get("component") == "hello"
+        ]
+
+        assert len(refs) == 1
+        assert refs[0].target == "../components/hello"
+
+    def test_parse_mpx_template_bind_event_references_script_function(self):
+        _, edges = self.parser.parse_file(FIXTURES / "sample_mpx.mpx")
+        refs = [
+            e for e in edges
+            if e.kind == "REFERENCES" and e.extra.get("handler") == "increment"
+        ]
+        sample_path = str(FIXTURES / "sample_mpx.mpx")
+
+        assert len(refs) == 1
+        assert refs[0].target == f"{sample_path}::increment"
+        assert refs[0].extra == {
+            "binding": "bindtap",
+            "handler": "increment",
+        }
+
+    def test_parse_mpx_template_bind_colon_event_references_script_function(self):
+        source = (
+            b"<template><button bind:tap=\"increment\">Count</button></template>\n"
+            b"<script setup>\n"
+            b"function increment() {}\n"
+            b"</script>\n"
+        )
+        path = Path("bind_colon.mpx")
+        _, edges = self.parser.parse_bytes(path, source)
+        refs = [
+            e for e in edges
+            if e.kind == "REFERENCES" and e.extra.get("handler") == "increment"
+        ]
+
+        assert len(refs) == 1
+        assert refs[0].target == "bind_colon.mpx::increment"
+        assert refs[0].extra == {
+            "binding": "bind:tap",
+            "handler": "increment",
+        }
+
     # --- Dart tests ---
 
     def test_detect_language_dart(self):

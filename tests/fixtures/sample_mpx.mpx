@@ -1,0 +1,31 @@
+<template>
+  <hello></hello>
+  <text>{{ title }}</text>
+  <button bindtap="increment">Count: {{ count }}</button>
+</template>
+
+<script lang="ts" setup>
+import { ref } from '@mpxjs/core'
+
+const count = ref(0)
+const title = ref('Mpx Sample Page')
+
+function increment() {
+  count.value++
+}
+
+defineExpose({
+  count,
+  title,
+  increment,
+})
+</script>
+
+<script type="application/json">
+  {
+    "usingComponents": {
+      "hello": "../components/hello"
+    },
+    "navigationBarTitleText": "Home"
+  }
+</script>
